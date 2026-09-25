@@ -9,9 +9,11 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import unicodedata
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from math import isfinite
 from typing import Any
@@ -23,6 +25,7 @@ from .update import (
     UPDATE_SOURCE,
     check_for_update,
     installed_version,
+    is_newer,
     latest_release_tag,
     managed_venv,
     update_source,
@@ -55,11 +58,13 @@ class Console:
         "bold": "1",
         "cyan": "36",
     }
+    SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    SPINNER_INTERVAL = 0.08
 
     def __init__(self, force_plain: bool = False) -> None:
+        self.interactive = not force_plain and sys.stdout.isatty()
         self.color = (
-            not force_plain
-            and sys.stdout.isatty()
+            self.interactive
             and "NO_COLOR" not in os.environ
             and os.environ.get("TERM") != "dumb"
         )
@@ -80,6 +85,37 @@ class Console:
 
     def error(self, message: str) -> None:
         print(f"{self.style('✗', 'red')} {_safe_terminal(message)}", file=sys.stderr)
+
+    @contextmanager
+    def status(self, message: str):
+        """Animate a spinner while a step runs; print the message once when non-interactive."""
+        if not self.interactive:
+            self.info(message)
+            yield
+            return
+        stop = threading.Event()
+        rendered = _safe_terminal(message)
+
+        def animate() -> None:
+            index = 0
+            while True:
+                frame = self.SPINNER[index % len(self.SPINNER)]
+                sys.stdout.write(f"\r{self.style(frame, 'cyan')} {rendered}")
+                sys.stdout.flush()
+                index += 1
+                if stop.wait(self.SPINNER_INTERVAL):
+                    return
+
+        worker = threading.Thread(target=animate, daemon=True)
+        worker.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            worker.join()
+            # Erase the spinner line so the caller's result message starts clean.
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
 
 
 def _safe_terminal(value: str) -> str:
@@ -311,7 +347,8 @@ def print_plan(console: Console, plan: CommitPlan, dry_run: bool) -> None:
 def run(args: argparse.Namespace, console: Console) -> int:
     try:
         repo = GitRepository.discover()
-        snapshot = repo.snapshot()
+        with console.status("Reading Git changes"):
+            snapshot = repo.snapshot()
     except GitError as exc:
         raise AppError(str(exc)) from exc
     if not snapshot.files:
@@ -331,14 +368,15 @@ def run(args: argparse.Namespace, console: Console) -> int:
         console.info(f"Found {len(snapshot.files)} changed file(s) in {repo.root}.")
         console.warning("The Git diff will be sent to the configured API provider for commit planning.")
         console.info(f"Using {args.model} at {credentials.base_url} (key: {credentials.source}).")
-        plan = request_plan(
-            snapshot.diff,
-            snapshot.files,
-            credentials,
-            args.model,
-            args.description,
-            args.timeout,
-        )
+        with console.status(f"Planning commits for {len(snapshot.files)} changed file(s)"):
+            plan = request_plan(
+                snapshot.diff,
+                snapshot.files,
+                credentials,
+                args.model,
+                args.description,
+                args.timeout,
+            )
         print_plan(console, plan, args.dry_run)
         if args.dry_run:
             console.success("Dry run complete; no commits were created.")
@@ -347,7 +385,8 @@ def run(args: argparse.Namespace, console: Console) -> int:
             console.warning("Cancelled; no commits were created.")
             return 0
         try:
-            hashes = repo.create_commits(snapshot, plan.commits)
+            with console.status("Creating commits"):
+                hashes = repo.create_commits(snapshot, plan.commits)
         except GitError as exc:
             raise AppError(str(exc)) from exc
         for commit, short_hash in zip(plan.commits, hashes, strict=True):
@@ -370,31 +409,36 @@ def run_update(console: Console) -> int:
         )
     python = venv / "bin" / "python"
     before = installed_version(python) or __version__
-    tag = latest_release_tag(timeout=5.0)
+    with console.status("Checking for the latest release"):
+        tag = latest_release_tag(timeout=5.0)
+    if tag is not None and not is_newer(tag, before):
+        console.success(f"Commitron is up to date ({before}).")
+        return 0
     source = update_source(tag)
     if tag:
-        console.info(f"Updating Commitron (current: {before}) to release {tag} ...")
+        label = f"Updating Commitron (current: {before}) to release {tag}"
     else:
         console.warning("No published release found; falling back to the main branch.")
-        console.info(f"Updating Commitron (current: {before}) from the main branch ...")
-    try:
-        result = subprocess.run(
-            [
-                str(python),
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--upgrade",
-                "--force-reinstall",
-                source,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise AppError(f"Could not run pip to update Commitron: {exc}") from exc
+        label = f"Updating Commitron (current: {before}) from the main branch"
+    with console.status(label):
+        try:
+            result = subprocess.run(
+                [
+                    str(python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--upgrade",
+                    "--force-reinstall",
+                    source,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise AppError(f"Could not run pip to update Commitron: {exc}") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         if not detail:
@@ -413,7 +457,8 @@ def notify_update(console: Console) -> None:
     if not sys.stdout.isatty():
         return
     try:
-        latest = check_for_update(__version__)
+        with console.status("Checking for a newer release"):
+            latest = check_for_update(__version__)
     except Exception:  # noqa: BLE001 - an update check must never break the user's command.
         return
     if latest:

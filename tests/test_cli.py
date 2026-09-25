@@ -155,15 +155,15 @@ class UpdateCommandTests(unittest.TestCase):
         self.assertIn(UPDATE_SOURCE, command)
 
     @patch("commitron.cli.subprocess.run")
-    @patch("commitron.cli.installed_version", side_effect=["0.1.0", "0.1.0"])
-    @patch("commitron.cli.latest_release_tag", return_value="v0.1.0")
+    @patch("commitron.cli.installed_version", return_value="0.2.0")
+    @patch("commitron.cli.latest_release_tag", return_value="v0.2.0")
     @patch("commitron.cli.managed_venv")
-    def test_update_reports_when_already_current(
+    def test_update_skips_pip_when_already_current(
         self, managed: MagicMock, tag: MagicMock, installed: MagicMock, run: MagicMock
     ) -> None:
         managed.return_value = Path("/tmp/commitron-venv")
-        run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         self.assertEqual(run_update(self.console), 0)
+        run.assert_not_called()
 
     @patch("commitron.cli.subprocess.run")
     @patch("commitron.cli.installed_version", return_value="0.1.0")
@@ -176,6 +176,23 @@ class UpdateCommandTests(unittest.TestCase):
         run.return_value = MagicMock(returncode=1, stdout="", stderr="network error")
         with self.assertRaises(AppError):
             run_update(self.console)
+
+
+class ConsoleStatusTests(unittest.TestCase):
+    def test_prints_message_once_when_not_interactive(self) -> None:
+        console = Console(force_plain=True)
+        with patch("builtins.print") as output, console.status("Working"):
+            pass
+        output.assert_called_once()
+        self.assertIn("Working", output.call_args.args[0])
+
+    def test_spinner_writes_when_interactive(self) -> None:
+        console = Console()
+        console.interactive = True
+        console.color = True
+        with patch("commitron.cli.sys.stdout") as stdout, console.status("Working"):
+            pass
+        self.assertTrue(stdout.write.called)
 
 
 if __name__ == "__main__":

@@ -71,7 +71,7 @@ If you installed with `install.sh`, upgrade in place from the latest release:
 commitron update
 ```
 
-The updater only applies to the managed installation under `~/.local/share/commitron` (or `$XDG_DATA_HOME/commitron`). It resolves the newest published release tag and installs that exact revision, so updates are reproducible and match what CI tested; if no release exists yet it falls back to the `main` branch. It upgrades that virtual environment with pip, reports the old and new versions, and leaves your configuration and credentials untouched. For a source/development checkout it exits with an error instead of modifying your environment; update those with `git pull` and `pip install -e .` as usual. Re-running the `install.sh` one-liner also remains idempotent.
+The updater only applies to the managed installation under `~/.local/share/commitron` (or `$XDG_DATA_HOME/commitron`). It resolves the newest published release tag and installs that exact revision, so updates are reproducible and match what CI tested; if no release exists yet it falls back to the `main` branch. If your installed version already matches the newest release, it reports that it is up to date without reinstalling. Long-running steps (checking, updating, planning, creating commits) show an animated spinner in interactive terminals. It leaves your configuration and credentials untouched. For a source/development checkout it exits with an error instead of modifying your environment; update those with `git pull` and `pip install -e .` as usual. Re-running the `install.sh` one-liner also remains idempotent.
 
 ### Automatic update checks
 
