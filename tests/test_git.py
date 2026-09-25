@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -13,7 +13,7 @@ from commitron.git import CommitPlan, GitError, GitRepository, PlannedCommit
 
 def git(path: Path, *args: str, check: bool = True) -> str:
     result = subprocess.run(
-        ["git", *args], cwd=path, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check
+        ["git", *args], cwd=path, text=True, capture_output=True, check=check
     )
     return result.stdout.strip()
 
@@ -130,8 +130,7 @@ class GitWorkflowTests(unittest.TestCase):
             result = subprocess.run(
                 ["git", "cat-file", "-e", "HEAD:two.txt"],
                 cwd=self.root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)

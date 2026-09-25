@@ -50,6 +50,7 @@ mkdir -p "$INSTALL_DIR" "$BIN_DIR"
 ln -sf "$VENV/bin/commitron" "$BIN_DIR/commitron"
 
 echo "Commitron installed at $BIN_DIR/commitron"
+echo "Update it later with: commitron update"
 case ":${PATH}:" in
   *":$BIN_DIR:"*) ;;
   *) echo "Add it to your PATH: export PATH=\"$BIN_DIR:\$PATH\"" ;;

@@ -29,7 +29,7 @@ class CommitPlan:
     @classmethod
     def from_json(
         cls, value: dict[str, Any], changed_files: list[str], include_description: bool
-    ) -> "CommitPlan":
+    ) -> CommitPlan:
         raw_commits = value.get("commits")
         if not isinstance(raw_commits, list) or not raw_commits:
             raise GitError("The API plan must contain a non-empty 'commits' array.")
@@ -117,8 +117,7 @@ class GitRepository:
                 cwd=cwd,
                 env=env,
                 input=input_data,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 check=False,
             )
         except FileNotFoundError as exc:
@@ -129,7 +128,7 @@ class GitRepository:
         return result
 
     @classmethod
-    def discover(cls, start_path: Path | None = None) -> "GitRepository":
+    def discover(cls, start_path: Path | None = None) -> GitRepository:
         result = cls._run(["rev-parse", "--show-toplevel"], cwd=start_path, check=False)
         if result.returncode != 0:
             raise GitError("Current directory is not inside a Git repository.")
