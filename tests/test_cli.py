@@ -15,12 +15,21 @@ from commitron.cli import (
     AppError,
     Console,
     Credentials,
+    _extract_json,
     build_parser,
     notify_update,
     request_plan,
     resolve_credentials,
     run_update,
 )
+
+
+def _chat_response(content: str, finish_reason: str | None = None) -> MagicMock:
+    response = MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(
+        {"choices": [{"message": {"content": content}, "finish_reason": finish_reason}]}
+    ).encode()
+    return response
 
 
 class CliConfigurationTests(unittest.TestCase):
@@ -87,6 +96,64 @@ class CliConfigurationTests(unittest.TestCase):
         self.assertEqual(request.full_url, "https://provider.example/v1/chat/completions")
         self.assertEqual(request.get_header("Authorization"), "Bearer secret")
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 10)
+
+
+class JsonExtractionTests(unittest.TestCase):
+    def test_accepts_plain_object(self) -> None:
+        self.assertEqual(_extract_json('{"commits": []}'), {"commits": []})
+
+    def test_unwraps_fenced_json(self) -> None:
+        self.assertEqual(_extract_json('```json\n{"a": 1}\n```'), {"a": 1})
+
+    def test_extracts_object_from_surrounding_prose(self) -> None:
+        self.assertEqual(_extract_json('Here you go:\n{"a": 1}\nHope that helps!'), {"a": 1})
+
+    def test_rejects_non_json(self) -> None:
+        with self.assertRaises(AppError):
+            _extract_json("not json")
+
+    def test_rejects_empty(self) -> None:
+        with self.assertRaises(AppError):
+            _extract_json("   ")
+
+
+class PlanRequestRetryTests(unittest.TestCase):
+    def credentials(self) -> Credentials:
+        return Credentials("secret", "https://provider.example/v1", "test")
+
+    @patch("commitron.cli.urllib.request.urlopen")
+    def test_retries_invalid_json_then_succeeds(self, urlopen: MagicMock) -> None:
+        valid = json.dumps({"commits": [{"files": ["one.py"], "title": "Add one"}]})
+        urlopen.side_effect = [
+            _chat_response("I cannot do that."),
+            _chat_response(f"```json\n{valid}\n```"),
+        ]
+        plan = request_plan("diff", ["one.py"], self.credentials(), "m", False, 10, 3)
+        self.assertEqual(plan.commits[0].title, "Add one")
+        self.assertEqual(urlopen.call_count, 2)
+
+    @patch("commitron.cli.urllib.request.urlopen")
+    def test_retries_rejected_plan_then_succeeds(self, urlopen: MagicMock) -> None:
+        duplicate = json.dumps({"commits": [{"files": ["one.py", "one.py"], "title": "Bad"}]})
+        valid = json.dumps({"commits": [{"files": ["one.py"], "title": "Add one"}]})
+        urlopen.side_effect = [_chat_response(duplicate), _chat_response(valid)]
+        plan = request_plan("diff", ["one.py"], self.credentials(), "m", False, 10, 3)
+        self.assertEqual(plan.commits[0].title, "Add one")
+        self.assertEqual(urlopen.call_count, 2)
+
+    @patch("commitron.cli.urllib.request.urlopen")
+    def test_gives_up_after_attempts(self, urlopen: MagicMock) -> None:
+        urlopen.return_value = _chat_response("nope")
+        with self.assertRaises(AppError):
+            request_plan("diff", ["one.py"], self.credentials(), "m", False, 10, 2)
+        self.assertEqual(urlopen.call_count, 2)
+
+    @patch("commitron.cli.urllib.request.urlopen")
+    def test_empty_message_reports_length_limit(self, urlopen: MagicMock) -> None:
+        urlopen.return_value = _chat_response("", finish_reason="length")
+        with self.assertRaises(AppError) as caught:
+            request_plan("diff", ["one.py"], self.credentials(), "m", False, 10, 1)
+        self.assertIn("length limit", str(caught.exception))
 
 
 class UpdateCommandTests(unittest.TestCase):

@@ -35,16 +35,18 @@ Or, from a checkout, run the included installer:
 ./install.sh
 ```
 
-The installer creates an isolated virtual environment under `~/.local/share/commitron` and puts the `commitron` command in `~/.local/bin`. Add that directory to `PATH` if needed:
+The installer creates an isolated virtual environment under `~/.local/share/commitron` and puts the `commitron` command in `~/.local/bin`. Add that directory to `PATH` if needed by appending it to your shell profile (`~/.bashrc` or `~/.zshrc`), then reloading it:
 
 ```sh
-export PATH="$HOME/.local/bin:$PATH"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
+source ~/.bashrc                                            # or ~/.zshrc
 ```
 
-Optional: add a short `commit` alias to your `~/.bashrc` or `~/.zshrc` (only if you don't already use that alias):
+Optional: add a short `commit` alias (only if you don't already use that alias). Append it to your shell profile so it persists across sessions:
 
 ```sh
-alias commit='commitron'
+echo "alias commit='commitron'" >> ~/.bashrc   # or ~/.zshrc
+source ~/.bashrc                               # or ~/.zshrc
 ```
 
 For development, `python3 -m pip install -e .` installs the command in the active Python environment. Python 3.10+ and Git are required. There are no runtime dependencies.
@@ -94,7 +96,7 @@ export OPENROUTER_API_KEY="your-key"
 commitron
 ```
 
-`OPENAI_API_KEY` is also detected. When it is the selected credential and no endpoint override is given, the app uses `https://api.openai.com/v1`. OpenRouter is preferred if both standard key variables are set. No key is saved to disk.
+`OPENAI_API_KEY` is also detected. When it is the selected credential and no endpoint override is given, the app uses `https://api.openai.com/v1`. OpenRouter is preferred if both standard key variables are set. Commitron itself never writes the key to disk; to keep it available across sessions, persist it yourself as described below.
 
 ```sh
 # Choose an OpenAI-compatible provider and model
@@ -104,11 +106,31 @@ commitron --base-url https://api.openai.com/v1 --model gpt-4o-mini
 export MY_LLM_SECRET="your-key"
 commitron --api-key-env MY_LLM_SECRET
 
-# Persist endpoint/model defaults in your shell environment
-export OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"
-export OPENAI_BASE_URL="https://api.openai.com/v1"
-export COMMITRON_MODEL="openrouter/free"
+# Persist endpoint/model defaults in your shell profile, then reload it
+{
+  echo 'export OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"'
+  echo 'export OPENAI_BASE_URL="https://api.openai.com/v1"'
+  echo 'export COMMITRON_MODEL="openrouter/free"'
+} >> ~/.bashrc   # or ~/.zshrc
+source ~/.bashrc # or ~/.zshrc
 ```
+
+### Persisting your API key securely
+
+Because Commitron reads the key from the environment, persisting it means exporting it at shell startup. Store it in a dedicated file that only your user can read, rather than putting it in `~/.bashrc`/`~/.zshrc` (which are typically world-readable and are often synced, backed up, or committed):
+
+```sh
+install -d -m 700 ~/.config/commitron
+printf 'API key: '
+read -rs OPENROUTER_API_KEY
+echo
+printf 'export OPENROUTER_API_KEY=%q\n' "$OPENROUTER_API_KEY" > ~/.config/commitron/env
+chmod 600 ~/.config/commitron/env
+echo '. "$HOME/.config/commitron/env"' >> ~/.bashrc   # or ~/.zshrc
+source ~/.bashrc                                       # or ~/.zshrc
+```
+
+The `read` prompt keeps the key out of your shell history, and the `0600` file is readable only by your user. Use the same pattern with `OPENAI_API_KEY` or a custom `--api-key-env` variable. Never commit `~/.config/commitron/env` or paste the key into issue reports. For protection at rest, keep the key in an OS keyring or secret manager (such as `secret-tool`, macOS `security`, or `pass`) and load it into `OPENROUTER_API_KEY` from your profile instead.
 
 Options:
 
@@ -122,6 +144,7 @@ Options:
 | `--api-key-env NAME` | Use a custom environment variable for the API key. |
 | `--timeout SECONDS` | API timeout (default: 90 seconds). |
 | `--max-diff-bytes N` | Maximum diff sent to the API (default: 500,000 bytes). |
+| `--retries N` | Retry the API request when it returns an unusable plan (default: 3). |
 | `--no-color` | Disable terminal colors. `NO_COLOR` is also respected. |
 | `--no-update-check` | Skip the automatic check for a newer release on this run. |
 

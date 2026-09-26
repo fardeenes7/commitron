@@ -39,6 +39,10 @@ class AppError(Exception):
     """An expected, user-facing application error."""
 
 
+class _RetryableError(AppError):
+    """The model returned an unusable plan; another attempt may succeed."""
+
+
 @dataclass(frozen=True)
 class Credentials:
     api_key: str
@@ -181,6 +185,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=500_000,
         help="refuse to send diffs larger than this many bytes (default: 500000)",
     )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="retry the API request when it returns an unusable plan (default: 3)",
+    )
     parser.add_argument("--no-color", action="store_true", help="disable terminal colors")
     parser.add_argument(
         "--no-update-check",
@@ -224,17 +234,68 @@ def resolve_credentials(args: argparse.Namespace) -> Credentials:
 
 
 def _extract_json(content: str) -> dict[str, Any]:
-    content = content.strip()
-    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", content, re.IGNORECASE | re.DOTALL)
+    text = content.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.IGNORECASE | re.DOTALL)
     if fenced:
-        content = fenced.group(1)
+        text = fenced.group(1).strip()
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            text = text[start : end + 1]
+    if not text:
+        raise _RetryableError("The API returned an empty response instead of JSON.")
     try:
-        value = json.loads(content)
+        value = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise AppError(f"The API returned invalid JSON: {exc.msg}.") from exc
+        snippet = " ".join(content.split())
+        if len(snippet) > 160:
+            snippet = f"{snippet[:160]}…"
+        raise _RetryableError(
+            f"The API returned invalid JSON ({exc.msg} at line {exc.lineno} column {exc.colno}). "
+            f"Response began: {snippet!r}"
+        ) from exc
     if not isinstance(value, dict):
-        raise AppError("The API response must be a JSON object.")
+        raise _RetryableError("The API response must be a JSON object.")
     return value
+
+
+def _chat_completion(
+    messages: list[dict[str, str]],
+    credentials: Credentials,
+    model: str,
+    timeout: float,
+) -> str:
+    url = f"{credentials.base_url}/chat/completions"
+    payload = json.dumps({"model": model, "temperature": 0.2, "messages": messages}).encode("utf-8")
+    headers = {"Authorization": f"Bearer {credentials.api_key}", "Content-Type": "application/json"}
+    if "openrouter.ai" in credentials.base_url:
+        headers["X-Title"] = "Commitron"
+    request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(4096).decode("utf-8", errors="replace")
+        raise AppError(f"API returned HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise AppError(f"Could not reach API: {exc.reason}") from exc
+    except (TimeoutError, OSError) as exc:
+        raise AppError(f"API request failed: {exc}") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AppError("The API returned an unreadable response.") from exc
+    try:
+        choice = result["choices"][0]
+        content = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise AppError("The API response did not contain a chat completion.") from exc
+    if not isinstance(content, str):
+        raise AppError("The API response contained an unsupported message format.")
+    if not content.strip():
+        finish = choice.get("finish_reason") if isinstance(choice, dict) else None
+        detail = " (the model hit its length limit)" if finish == "length" else ""
+        raise _RetryableError(f"The API returned an empty message{detail}.")
+    return content
 
 
 def request_plan(
@@ -244,6 +305,7 @@ def request_plan(
     model: str,
     include_description: bool,
     timeout: float,
+    attempts: int = 3,
 ) -> CommitPlan:
     format_hint = (
         '{"commits":[{"files":["path"],"title":"type(scope): imperative summary",'
@@ -284,40 +346,35 @@ def request_plan(
         f"{diff}\n"
         "</diff>"
     )
-    url = f"{credentials.base_url}/chat/completions"
-    payload = json.dumps(
-        {
-            "model": model,
-            "temperature": 0.2,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        }
-    ).encode("utf-8")
-    headers = {"Authorization": f"Bearer {credentials.api_key}", "Content-Type": "application/json"}
-    if "openrouter.ai" in credentials.base_url:
-        headers["X-Title"] = "Commitron"
-    request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read(4096).decode("utf-8", errors="replace")
-        raise AppError(f"API returned HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise AppError(f"Could not reach API: {exc.reason}") from exc
-    except (TimeoutError, OSError) as exc:
-        raise AppError(f"API request failed: {exc}") from exc
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AppError("The API returned an unreadable response.") from exc
-    try:
-        content = result["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise AppError("The API response did not contain a chat completion.") from exc
-    if not isinstance(content, str):
-        raise AppError("The API response contained an unsupported message format.")
-    try:
-        return CommitPlan.from_json(_extract_json(content), files, include_description)
-    except GitError as exc:
-        raise AppError(str(exc)) from exc
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    last_error = "unknown error"
+    for attempt in range(1, attempts + 1):
+        content: str | None = None
+        try:
+            content = _chat_completion(messages, credentials, model, timeout)
+            return CommitPlan.from_json(_extract_json(content), files, include_description)
+        except (GitError, _RetryableError) as exc:
+            last_error = str(exc)
+            if attempt >= attempts:
+                break
+            if content is not None:
+                messages.append({"role": "assistant", "content": content})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"That response was rejected: {last_error} "
+                            "Return only the corrected JSON plan, assigning each changed path to exactly "
+                            "one commit."
+                        ),
+                    }
+                )
+    raise AppError(
+        f"The API could not produce a valid commit plan after {attempts} attempt(s). Last error: {last_error}"
+    )
 
 
 def confirm(console: Console) -> bool:
@@ -376,6 +433,7 @@ def run(args: argparse.Namespace, console: Console) -> int:
                 args.model,
                 args.description,
                 args.timeout,
+                args.retries,
             )
         print_plan(console, plan, args.dry_run)
         if args.dry_run:
@@ -472,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--timeout must be a finite number greater than zero")
     if args.max_diff_bytes <= 0:
         parser.error("--max-diff-bytes must be greater than zero")
+    if args.retries < 1:
+        parser.error("--retries must be at least 1")
     args.model = args.model or os.environ.get("COMMITRON_MODEL") or DEFAULT_MODEL
     console = Console(args.no_color)
     try:
